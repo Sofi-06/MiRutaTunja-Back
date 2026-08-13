@@ -1,6 +1,6 @@
-# 🚍 Bus Tunja
+# 🚍 MiRutaTunja
 
-Interfaz web de Bus Tunja, una plataforma orientada a mejorar la experiencia de movilidad urbana en Tunja.
+Interfaz web de MiRutaTunja, una plataforma orientada a mejorar la experiencia de movilidad urbana en Tunja.
 
 ## Estado del proyecto
 
@@ -13,12 +13,13 @@ Interfaz web de Bus Tunja, una plataforma orientada a mejorar la experiencia de 
 - Puntos de interés
 - Rutas favoritas
 - Integración con servicios inteligentes
-ETC
 
 ## Tecnologías
 
-- A elegir
+- React
+- Vite
+- Bootstrap
 
 ---
 
-Desarrollado como parte de la fase inicial.
+Desarrollado como parte de la fase inicial de MiRutaTunja.
