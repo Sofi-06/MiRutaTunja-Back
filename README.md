@@ -1,25 +1,25 @@
-# 🚍 MiRutaTunja
+# ⚙️ MiRutaTunja API
 
-Interfaz web de MiRutaTunja, una plataforma orientada a mejorar la experiencia de movilidad urbana en Tunja.
+API encargada de la gestión de datos y servicios de la plataforma MiRutaTunja.
 
 ## Estado del proyecto
 
 🟡 MVP en desarrollo
 
-## Próximamente
+## Funcionalidades previstas
 
-- Consulta de rutas
-- Visualización de paraderos
-- Puntos de interés
-- Rutas favoritas
-- Integración con servicios inteligentes
+- Gestión de rutas de transporte
+- Gestión de paraderos
+- Consulta de información de movilidad
+- Gestión de puntos de interés
+- Integración de funcionalidades inteligentes
 
 ## Tecnologías
 
-- React
-- Vite
-- Bootstrap
+- NestJS
+- PostgreSQL
+- Prisma ORM
 
 ---
 
-Desarrollado como parte de la fase inicial de MiRutaTunja.
+Backend en fase de diseño y construcción para el MVP de MiRutaTunja.
