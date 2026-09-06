@@ -54,6 +54,51 @@ const addCoords = (target, source) => {
   }
 };
 
+// Encadenar tramos para formar un trazado topológicamente continuo
+function chainSegments(segments) {
+  if (!segments || segments.length === 0) return [];
+  if (segments.length === 1) return segments[0];
+
+  const pool = segments.map(seg => [...seg]);
+  let result = pool.shift();
+
+  while (pool.length > 0) {
+    const tail = result[result.length - 1];
+    let bestIdx = -1;
+    let bestDist = Infinity;
+    let shouldReverse = false;
+
+    for (let i = 0; i < pool.length; i++) {
+      const seg = pool[i];
+      const headDist = getHaversineDistance(tail, seg[0]);
+      const tailDist = getHaversineDistance(tail, seg[seg.length - 1]);
+
+      if (headDist < bestDist) {
+        bestDist = headDist;
+        bestIdx = i;
+        shouldReverse = false;
+      }
+      if (tailDist < bestDist) {
+        bestDist = tailDist;
+        bestIdx = i;
+        shouldReverse = true;
+      }
+    }
+
+    if (bestIdx !== -1 && bestDist < 1200) {
+      const nextSeg = pool.splice(bestIdx, 1)[0];
+      if (shouldReverse) nextSeg.reverse();
+      addCoords(result, nextSeg);
+    } else {
+      // Si el tramo más cercano está aislado, simplemente agregarlo
+      const nextSeg = pool.shift();
+      addCoords(result, nextSeg);
+    }
+  }
+
+  return result;
+}
+
 // Cargar todas las rutas al iniciar el servidor
 const loadAllRoutes = () => {
   try {
@@ -63,8 +108,8 @@ const loadAllRoutes = () => {
         const fullPath = path.join(assetsDir, relPath);
         if (fs.existsSync(fullPath)) {
           const geojson = JSON.parse(fs.readFileSync(fullPath, 'utf8'));
-          let routeIda = [];
-          let routeVuelta = [];
+          let segmentsIda = [];
+          let segmentsVuelta = [];
           
           geojson.features.forEach(feature => {
             if (feature.geometry && feature.geometry.type === 'LineString') {
@@ -72,22 +117,22 @@ const loadAllRoutes = () => {
               const coords = feature.geometry.coordinates;
               
               if (stroke === '#7cb342' || stroke === '#0288d1') {
-                addCoords(routeIda, coords);
+                segmentsIda.push(coords);
               } else if (stroke === '#ffcc80' || stroke === '#fada80' || stroke === '#e65100') {
-                addCoords(routeVuelta, coords);
+                segmentsVuelta.push(coords);
               } else {
-                addCoords(routeIda, coords);
+                segmentsIda.push(coords);
               }
             }
           });
           
           routesRegistry[key] = {
-            ida: routeIda,
-            vuelta: routeVuelta
+            ida: chainSegments(segmentsIda),
+            vuelta: chainSegments(segmentsVuelta)
           };
         }
       }
-      console.log(`[Rutas Cargadas] Total: ${Object.keys(routesRegistry).length} rutas en el registro.`);
+      console.log(`[Rutas Cargadas] Total: ${Object.keys(routesRegistry).length} rutas en el registro con encadenamiento topológico.`);
     } else {
       console.warn(`[Warning] No se encontró la carpeta de assets de rutas en: ${assetsDir}`);
     }
@@ -100,6 +145,7 @@ loadAllRoutes();
 
 // Fórmula de Haversine para calcular distancias reales en metros
 function getHaversineDistance(coords1, coords2) {
+  if (!coords1 || !coords2) return Infinity;
   const lon1 = coords1[0];
   const lat1 = coords1[1];
   const lon2 = coords2[0];
@@ -119,18 +165,287 @@ function getHaversineDistance(coords1, coords2) {
   return R * c;
 }
 
-// Encontrar la coordenada más cercana en una lista de puntos
-function findClosestPoint(targetPt, coordsList) {
-  let minDistance = Infinity;
-  let closestIndex = -1;
-  for (let i = 0; i < coordsList.length; i++) {
-    const dist = getHaversineDistance(targetPt, coordsList[i]);
-    if (dist < minDistance) {
-      minDistance = dist;
-      closestIndex = i;
+// Proyectar un punto ortogonalmente sobre un segmento de línea [a, b]
+function projectPointOnSegment(p, a, b) {
+  if (!p || !a || !b) return { point: a || [0, 0], distance: Infinity, t: 0 };
+
+  const latMid = ((a[1] + b[1]) / 2) * (Math.PI / 180);
+  const cosLat = Math.cos(latMid);
+
+  // Vector AB en metros aproximados en el plano local
+  const dx = (b[0] - a[0]) * 111320 * cosLat;
+  const dy = (b[1] - a[1]) * 110540;
+  const segLenSq = dx * dx + dy * dy;
+
+  if (segLenSq < 0.0001) {
+    return {
+      point: [a[0], a[1]],
+      distance: getHaversineDistance(p, a),
+      t: 0
+    };
+  }
+
+  // Vector AP en metros
+  const px = (p[0] - a[0]) * 111320 * cosLat;
+  const py = (p[1] - a[1]) * 110540;
+
+  let t = (px * dx + py * dy) / segLenSq;
+  t = Math.max(0, Math.min(1, t));
+
+  const projLon = a[0] + t * (b[0] - a[0]);
+  const projLat = a[1] + t * (b[1] - a[1]);
+  const projPt = [projLon, projLat];
+
+  return {
+    point: projPt,
+    distance: getHaversineDistance(p, projPt),
+    t: t
+  };
+}
+
+// Resolver tramo de caminata inteligente y sin desvíos absurdos
+async function resolveWalkingLeg(startPt, endPt) {
+  if (!startPt || !endPt) {
+    return { path: [], distance: 0, duration: 0 };
+  }
+
+  const euclideanDist = getHaversineDistance(startPt, endPt);
+
+  // 1. Proximidad inmediata (< 15 metros): Ya está en el punto
+  if (euclideanDist < 15) {
+    return {
+      path: [],
+      distance: 0,
+      duration: 0
+    };
+  }
+
+  // 2. Caminata corta urbana (< 80 metros): Conexión directa y limpia
+  // Evita desvíos absurdos causados por falta de cruces peatonales en OSM
+  if (euclideanDist < 80) {
+    const dist = euclideanDist * 1.08;
+    return {
+      path: [startPt, endPt],
+      distance: dist,
+      duration: dist / 1.39 // 5 km/h (~1.39 m/s)
+    };
+  }
+
+  // 3. Caminata media o larga (>= 80 metros): Consultar OSRM con filtro anti-desvíos
+  try {
+    const url = `https://router.project-osrm.org/route/v1/walking/${startPt[0]},${startPt[1]};${endPt[0]},${endPt[1]}?overview=full&geometries=geojson`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const resp = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.routes && data.routes.length > 0) {
+        const route = data.routes[0];
+        const osrmDist = route.distance;
+        const detourRatio = osrmDist / euclideanDist;
+
+        // Si la ruta de OSRM es natural (ratio <= 1.45), usamos su trazado de calles
+        if (detourRatio <= 1.45) {
+          return {
+            path: route.geometry.coordinates,
+            distance: route.distance,
+            duration: route.duration
+          };
+        } else {
+          console.log(`[Anti-Desvío] OSRM generó desvío excesivo: ${osrmDist.toFixed(0)}m vs ${euclideanDist.toFixed(0)}m directa (Ratio: ${detourRatio.toFixed(2)}x > 1.45). Usando trayecto directo limpio.`);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[OSRM Walking]', err.message);
+  }
+
+  // Fallback limpio con factor de malla urbana realista
+  const dist = euclideanDist * 1.18;
+  return {
+    path: [startPt, endPt],
+    distance: dist,
+    duration: dist / 1.39
+  };
+}
+
+// Encontrar el mejor par de subida y bajada proyectando sobre los segmentos continuos de la ruta
+function findBestBoardingAndDropoff(originPt, destPt, coordsList) {
+  const numPts = coordsList ? coordsList.length : 0;
+  if (numPts < 2) return null;
+
+  // Precalcular distancias acumuladas de los vértices
+  const cumDists = [0];
+  for (let k = 0; k < numPts - 1; k++) {
+    cumDists.push(cumDists[k] + getHaversineDistance(coordsList[k], coordsList[k + 1]));
+  }
+
+  // Proyectar Origen sobre cada segmento de la ruta
+  const origProjections = [];
+  for (let k = 0; k < numPts - 1; k++) {
+    const proj = projectPointOnSegment(originPt, coordsList[k], coordsList[k + 1]);
+    const distAlongRoute = cumDists[k] + getHaversineDistance(coordsList[k], proj.point);
+    origProjections.push({
+      segIdx: k,
+      point: proj.point,
+      walkDist: proj.distance,
+      distAlongRoute: distAlongRoute,
+      t: proj.t
+    });
+  }
+
+  // Proyectar Destino sobre cada segmento de la ruta
+  const destProjections = [];
+  for (let k = 0; k < numPts - 1; k++) {
+    const proj = projectPointOnSegment(destPt, coordsList[k], coordsList[k + 1]);
+    const distAlongRoute = cumDists[k] + getHaversineDistance(coordsList[k], proj.point);
+    destProjections.push({
+      segIdx: k,
+      point: proj.point,
+      walkDist: proj.distance,
+      distAlongRoute: distAlongRoute,
+      t: proj.t
+    });
+  }
+
+  let minScore = Infinity;
+  let bestCandidate = null;
+
+  for (let i = 0; i < origProjections.length; i++) {
+    const on = origProjections[i];
+    if (on.walkDist > 2200) continue;
+
+    for (let j = 0; j < destProjections.length; j++) {
+      const off = destProjections[j];
+      if (off.walkDist > 2200) continue;
+
+      // El punto de bajada debe ocurrir después del punto de subida en el sentido del bus
+      const busDist = off.distAlongRoute - on.distAlongRoute;
+      if (busDist < 50) continue; // Descartar micro-tramos en bus menores a 50m
+
+      // Función de optimización:
+      // - Prioridad máxima a minimizar caminata de origen y destino (peso 2.0x)
+      // - Minimizar vueltas y desvíos excesivos en bus (peso 0.08x)
+      const score = (on.walkDist * 2.0) + (off.walkDist * 2.0) + (busDist * 0.08);
+
+      if (score < minScore) {
+        minScore = score;
+        bestCandidate = {
+          on: on,
+          off: off,
+          busDist: busDist,
+          score: score,
+          walkOrigin: on.walkDist,
+          walkDest: off.walkDist
+        };
+      }
     }
   }
-  return closestIndex;
+
+  if (bestCandidate) {
+    const on = bestCandidate.on;
+    const off = bestCandidate.off;
+
+    // Construir la polilínea exacta del bus desde la proyección de subida hasta la de bajada
+    const rawBusCoords = [];
+    rawBusCoords.push(on.point);
+
+    if (on.segIdx === off.segIdx) {
+      rawBusCoords.push(off.point);
+    } else {
+      for (let k = on.segIdx + 1; k <= off.segIdx; k++) {
+        rawBusCoords.push(coordsList[k]);
+      }
+      rawBusCoords.push(off.point);
+    }
+
+    // Filtrar puntos duplicados o consecutivos ultra cercanos (< 0.5m)
+    const cleanedBusCoords = [];
+    for (const pt of rawBusCoords) {
+      if (cleanedBusCoords.length === 0) {
+        cleanedBusCoords.push(pt);
+      } else {
+        const last = cleanedBusCoords[cleanedBusCoords.length - 1];
+        if (getHaversineDistance(last, pt) > 0.5) {
+          cleanedBusCoords.push(pt);
+        }
+      }
+    }
+
+    return {
+      boardingPoint: on.point,
+      dropoffPoint: off.point,
+      busCoords: cleanedBusCoords,
+      busDist: bestCandidate.busDist,
+      score: bestCandidate.score,
+      walkOrigin: bestCandidate.walkOrigin,
+      walkDest: bestCandidate.walkDest
+    };
+  }
+
+  return null;
+}
+
+// Evaluar un código de ruta específico para origen y destino
+function evaluateRouteForPoints(key, originPt, destPt) {
+  const routeData = routesRegistry[key];
+  if (!routeData) return null;
+  const coordsIda = routeData.ida || [];
+  const coordsVuelta = routeData.vuelta || [];
+
+  const candidateOptions = [];
+
+  if (coordsIda.length >= 2) {
+    const bestIda = findBestBoardingAndDropoff(originPt, destPt, coordsIda);
+    if (bestIda) {
+      candidateOptions.push({
+        direction: 'ida',
+        routeKey: key,
+        ...bestIda
+      });
+    }
+  }
+
+  if (coordsVuelta.length >= 2) {
+    const bestVuelta = findBestBoardingAndDropoff(originPt, destPt, coordsVuelta);
+    if (bestVuelta) {
+      candidateOptions.push({
+        direction: 'vuelta',
+        routeKey: key,
+        ...bestVuelta
+      });
+    }
+  }
+
+  if (coordsIda.length > 0 && coordsVuelta.length > 0) {
+    const continuousIdaVuelta = [...coordsIda, ...coordsVuelta];
+    const bestContIdaVuelta = findBestBoardingAndDropoff(originPt, destPt, continuousIdaVuelta);
+    if (bestContIdaVuelta) {
+      candidateOptions.push({
+        direction: 'circuito',
+        routeKey: key,
+        ...bestContIdaVuelta
+      });
+    }
+
+    const continuousVueltaIda = [...coordsVuelta, ...coordsIda];
+    const bestContVueltaIda = findBestBoardingAndDropoff(originPt, destPt, continuousVueltaIda);
+    if (bestContVueltaIda) {
+      candidateOptions.push({
+        direction: 'circuito',
+        routeKey: key,
+        ...bestContVueltaIda
+      });
+    }
+  }
+
+  if (candidateOptions.length > 0) {
+    candidateOptions.sort((a, b) => a.score - b.score);
+    return candidateOptions[0];
+  }
+  return null;
 }
 
 // Endpoint POST /routes
@@ -149,69 +464,55 @@ app.post('/routes', async (req, res) => {
       return res.status(400).json({ error: 'Coordinates must be valid numbers' });
     }
 
-    // Normalizar la ruta pedida (ej: "R-01" -> "R1")
-    let targetKey = 'R1';
-    if (routeCode && typeof routeCode === 'string') {
-      const match = routeCode.match(/R-?0*(\d+)/i);
-      if (match) {
-        targetKey = `R${match[1]}`;
-      } else {
-        targetKey = routeCode;
-      }
-    }
-
-    const routeData = routesRegistry[targetKey] || routesRegistry['R1'];
-    const coordsIda = routeData ? routeData.ida : [];
-    const coordsVuelta = routeData ? routeData.vuelta : [];
-
-    let bestDirection = null;
-    let bestOnIdx = -1;
-    let bestOffIdx = -1;
-    let minWalkDist = Infinity;
-
     const originPt = [origin.lng, origin.lat];
     const destPt = [destination.lng, destination.lat];
 
-    // Evaluar sentido Ida
-    if (coordsIda.length > 0) {
-      const idxOn = findClosestPoint(originPt, coordsIda);
-      const idxOff = findClosestPoint(destPt, coordsIda);
-      if (idxOff > idxOn) {
-        const walkDist = getHaversineDistance(originPt, coordsIda[idxOn]) + 
-                         getHaversineDistance(destPt, coordsIda[idxOff]);
-        if (walkDist < minWalkDist) {
-          minWalkDist = walkDist;
-          bestDirection = 'ida';
-          bestOnIdx = idxOn;
-          bestOffIdx = idxOff;
-        }
+    // Evaluar todas las rutas disponibles en la red de Tunja
+    const allEvaluated = [];
+    for (const key of Object.keys(routesRegistry)) {
+      const evalRes = evaluateRouteForPoints(key, originPt, destPt);
+      if (evalRes) {
+        // Ponderación global:
+        // Priorizar fuertemente minimizar la caminata en destino (1.8x) y origen (1.3x)
+        const globalScore = (evalRes.walkOrigin * 1.3) + (evalRes.walkDest * 1.8) + (evalRes.busDist * 0.04);
+        allEvaluated.push({
+          ...evalRes,
+          globalScore
+        });
       }
     }
 
-    // Evaluar sentido Vuelta
-    if (coordsVuelta.length > 0) {
-      const idxOn = findClosestPoint(originPt, coordsVuelta);
-      const idxOff = findClosestPoint(destPt, coordsVuelta);
-      if (idxOff > idxOn) {
-        const walkDist = getHaversineDistance(originPt, coordsVuelta[idxOn]) + 
-                         getHaversineDistance(destPt, coordsVuelta[idxOff]);
-        if (walkDist < minWalkDist) {
-          minWalkDist = walkDist;
-          bestDirection = 'vuelta';
-          bestOnIdx = idxOn;
-          bestOffIdx = idxOff;
-        }
+    allEvaluated.sort((a, b) => a.globalScore - b.globalScore);
+
+    // Normalizar la ruta pedida (ej: "R-01" -> "R1", "R22", etc.)
+    let requestedKey = null;
+    if (routeCode && typeof routeCode === 'string' && routeCode !== 'PERS' && routeCode !== 'AUTO' && routeCode !== 'WALK') {
+      const match = routeCode.match(/R-?0*(\d+)/i);
+      if (match) {
+        requestedKey = `R${match[1]}`;
+      } else {
+        requestedKey = routeCode;
       }
     }
 
-    // Si encontramos una conexión válida construimos el trayecto multimodal
-    if (bestDirection) {
-      const activeCoords = bestDirection === 'ida' ? coordsIda : coordsVuelta;
-      const P_on = activeCoords[bestOnIdx];
-      const P_off = activeCoords[bestOffIdx];
-      
-      // Tramo B (Ruta en Bus)
-      const busCoords = activeCoords.slice(bestOnIdx, bestOffIdx + 1);
+    let bestOption = null;
+    if (requestedKey && routesRegistry[requestedKey]) {
+      // Si el usuario seleccionó explícitamente una ruta específica
+      bestOption = evaluateRouteForPoints(requestedKey, originPt, destPt);
+    }
+
+    // Si no se solicitó una ruta específica o la ruta específica no conecta, tomamos la más eficiente de la ciudad
+    if (!bestOption && allEvaluated.length > 0) {
+      bestOption = allEvaluated[0];
+    }
+
+    const selectedRouteKey = bestOption ? bestOption.routeKey : (requestedKey || 'R1');
+
+    if (bestOption) {
+      const busCoords = bestOption.busCoords;
+      const bestDirection = bestOption.direction;
+      const P_on = bestOption.boardingPoint;
+      const P_off = bestOption.dropoffPoint;
       
       let distB = 0;
       for (let i = 0; i < busCoords.length - 1; i++) {
@@ -219,54 +520,25 @@ app.post('/routes', async (req, res) => {
       }
       const durB = distB / 6.94; // 25 km/h en m/s
 
-      // OSRM a pie para Tramo A (Caminata de Origen) y Tramo C (Caminata de Destino)
-      const urlA = `https://router.project-osrm.org/route/v1/walking/${origin.lng},${origin.lat};${P_on[0]},${P_on[1]}?overview=full&geometries=geojson`;
-      const urlC = `https://router.project-osrm.org/route/v1/walking/${P_off[0]},${P_off[1]};${destination.lng},${destination.lat}?overview=full&geometries=geojson`;
-
-      const [resA, resC] = await Promise.all([
-        fetch(urlA).then(r => r.json()).catch(() => null),
-        fetch(urlC).then(r => r.json()).catch(() => null)
+      // Resolver tramos de caminata A y C de forma inteligente y sin desvíos
+      const [legA, legC] = await Promise.all([
+        resolveWalkingLeg(originPt, P_on),
+        resolveWalkingLeg(P_off, destPt)
       ]);
 
-      let pathA = [originPt, P_on];
-      let distA = getHaversineDistance(originPt, P_on);
-      let durA = distA / 1.39; // 5 km/h en m/s
+      const pathA = legA.path;
+      const distA = legA.distance;
+      const durA = legA.duration;
 
-      // Si la distancia a pie del origen es menor a 15 metros, no hay tramo de caminata inicial (se alinea exacto)
-      if (distA < 15) {
-        pathA = [];
-        distA = 0;
-        durA = 0;
-      } else {
-        if (resA && resA.routes && resA.routes.length > 0) {
-          pathA = resA.routes[0].geometry.coordinates;
-          distA = resA.routes[0].distance;
-          durA = resA.routes[0].duration;
-        }
-      }
-
-      let pathC = [P_off, destPt];
-      let distC = getHaversineDistance(P_off, destPt);
-      let durC = distC / 1.39;
-
-      // Si la distancia a pie del destino es menor a 15 metros, no hay tramo de caminata final (se alinea exacto)
-      if (distC < 15) {
-        pathC = [];
-        distC = 0;
-        durC = 0;
-      } else {
-        if (resC && resC.routes && resC.routes.length > 0) {
-          pathC = resC.routes[0].geometry.coordinates;
-          distC = resC.routes[0].distance;
-          durC = resC.routes[0].duration;
-        }
-      }
+      const pathC = legC.path;
+      const distC = legC.distance;
+      const durC = legC.duration;
 
       const totalDistance = distA + distB + distC;
       const totalDuration = durA + durB + durC;
       const combinedRoute = [...pathA, ...busCoords, ...pathC];
 
-      console.log(`[Multimodal Route (${targetKey})] Direction: ${bestDirection}. Origin Walk: ${distA.toFixed(1)}m, Bus: ${distB.toFixed(1)}m, Dest Walk: ${distC.toFixed(1)}m`);
+      console.log(`[Multimodal Route (${selectedRouteKey})] Direction: ${bestDirection}. Origin Walk: ${distA.toFixed(1)}m, Bus: ${distB.toFixed(1)}m, Dest Walk: ${distC.toFixed(1)}m`);
 
       return res.json({
         isMultimodal: true,
@@ -276,6 +548,16 @@ app.post('/routes', async (req, res) => {
         tramoA: pathA,
         tramoB: busCoords,
         tramoC: pathC,
+        boardingPoint: P_on,
+        dropoffPoint: P_off,
+        selectedRouteKey: selectedRouteKey,
+        alternatives: allEvaluated.slice(0, 5).map(item => ({
+          routeKey: item.routeKey,
+          direction: item.direction,
+          walkOrigin: item.walkOrigin,
+          walkDest: item.walkDest,
+          busDist: item.busDist
+        })),
         details: {
           walkDistanceOrigin: distA,
           walkDurationOrigin: durA,
@@ -284,34 +566,21 @@ app.post('/routes', async (req, res) => {
           walkDistanceDest: distC,
           walkDurationDest: durC,
           direction: bestDirection,
-          routeCode: targetKey
+          routeCode: selectedRouteKey,
+          boardingPoint: P_on,
+          dropoffPoint: P_off
         }
       });
     } else {
-      // Fallback a caminata directa
-      const coordinatesStr = `${origin.lng},${origin.lat};${destination.lng},${destination.lat}`;
-      const osrmUrl = `https://router.project-osrm.org/route/v1/walking/${coordinatesStr}?overview=full&geometries=geojson`;
-
-      console.log(`No bus connection found for ${targetKey}. Fallback to direct walk via OSRM: ${osrmUrl}`);
-      const response = await fetch(osrmUrl);
-      
-      if (!response.ok) {
-        throw new Error(`OSRM API responded with status ${response.status}`);
-      }
-
-      const data = await response.json();
-
-      if (!data.routes || data.routes.length === 0) {
-        return res.status(404).json({ error: 'No route found' });
-      }
-
-      const routeData = data.routes[0];
+      // Fallback a caminata directa limpia
+      const directWalk = await resolveWalkingLeg(originPt, destPt);
+      const fallbackPath = directWalk.path.length > 0 ? directWalk.path : [originPt, destPt];
 
       return res.json({
         isMultimodal: false,
-        distance: routeData.distance,
-        duration: routeData.duration,
-        route: routeData.geometry.coordinates
+        distance: directWalk.distance,
+        duration: directWalk.duration,
+        route: fallbackPath
       });
     }
 
