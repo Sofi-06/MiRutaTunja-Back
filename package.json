@@ -4,7 +4,7 @@
   "description": "Backend para calcular rutas en Tunja usando OSRM",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node --env-file-if-exists=.env index.js",
     "test": "jest --runInBand --detectOpenHandles"
   },
   "dependencies": {
