@@ -1,4 +1,5 @@
 const { getHaversineDistance, projectPointOnSegment } = require('../utils/geo');
+const { compareRouteCandidates } = require('../utils/routeCandidateComparator');
 const { routesRegistry } = require('../data/routeRegistry');
 const osrmService = require('./osrm.service');
 const config = require('../config');
@@ -48,7 +49,6 @@ function findBestBoardingAndDropoff(originPt, destPt, coordsList) {
     });
   }
 
-  let minScore = Infinity;
   let bestCandidate = null;
 
   for (let i = 0; i < origProjections.length; i++) {
@@ -63,21 +63,19 @@ function findBestBoardingAndDropoff(originPt, destPt, coordsList) {
       const busDist = off.distAlongRoute - on.distAlongRoute;
       if (busDist < 50) continue; // Descartar micro-tramos en bus menores a 50m
 
-      // Función de optimización:
-      // - Prioridad máxima a minimizar caminata de origen y destino (peso 2.0x)
-      // - Minimizar vueltas y desvíos excesivos en bus (peso 0.08x)
-      const score = on.walkDist * 2.0 + off.walkDist * 2.0 + busDist * 0.08;
+      const candidate = {
+        on: on,
+        off: off,
+        busDist: busDist,
+        walkOrigin: on.walkDist,
+        walkDest: off.walkDist
+      };
 
-      if (score < minScore) {
-        minScore = score;
-        bestCandidate = {
-          on: on,
-          off: off,
-          busDist: busDist,
-          score: score,
-          walkOrigin: on.walkDist,
-          walkDest: off.walkDist
-        };
+      // Elegir el mejor par abordaje/descenso con el mismo criterio jerárquico
+      // (caminata al destino > caminata al origen > distancia en bus) que se usa
+      // luego para comparar rutas completas entre sí.
+      if (!bestCandidate || compareRouteCandidates(candidate, bestCandidate) < 0) {
+        bestCandidate = candidate;
       }
     }
   }
@@ -117,7 +115,6 @@ function findBestBoardingAndDropoff(originPt, destPt, coordsList) {
       dropoffPoint: off.point,
       busCoords: cleanedBusCoords,
       busDist: bestCandidate.busDist,
-      score: bestCandidate.score,
       walkOrigin: bestCandidate.walkOrigin,
       walkDest: bestCandidate.walkDest
     };
@@ -186,7 +183,7 @@ function evaluateRouteForPoints(key, originPt, destPt) {
   }
 
   if (candidateOptions.length > 0) {
-    candidateOptions.sort((a, b) => a.score - b.score);
+    candidateOptions.sort(compareRouteCandidates);
     return candidateOptions[0];
   }
   return null;
@@ -206,15 +203,14 @@ async function calculateOptimalRoute({ origin, destination, routeCode }) {
   for (const key of Object.keys(routesRegistry)) {
     const evalRes = evaluateRouteForPoints(key, originPt, destPt);
     if (evalRes) {
-      const globalScore = evalRes.walkOrigin * 1.3 + evalRes.walkDest * 1.8 + evalRes.busDist * 0.04;
-      allEvaluated.push({
-        ...evalRes,
-        globalScore
-      });
+      allEvaluated.push(evalRes);
     }
   }
 
-  allEvaluated.sort((a, b) => a.globalScore - b.globalScore);
+  // Elegir la mejor ruta entre las evaluadas con el mismo criterio jerárquico:
+  // 1) menor caminata al destino, 2) desempate por caminata al origen,
+  // 3) desempate por distancia en bus.
+  allEvaluated.sort(compareRouteCandidates);
 
   // Normalizar la ruta pedida (ej: "R-01" -> "R1", "R22", etc.)
   let requestedKey = null;
